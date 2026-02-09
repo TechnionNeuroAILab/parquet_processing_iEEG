@@ -7,7 +7,7 @@ import datetime as dt
 import os
 
 # Disable warnings from docker
-os.environ.setdefault("RAY_DISABLE_METRICS", "1")
+# os.environ.setdefault("RAY_DISABLE_METRICS", "1")
 os.environ.setdefault("RAY_TMPDIR", "/root/capsule/results/ray_tmp")
 os.makedirs(os.environ["RAY_TMPDIR"], exist_ok=True)
 
@@ -53,254 +53,131 @@ class Pipeline(BrainsetPipeline):
 
     @classmethod
     def get_manifest(cls, raw_dir: Path, args) -> pd.DataFrame:
-
         raw_dir = Path(raw_dir)
 
-        # all metadata JSONs are directly in raw_dir
         meta_paths = sorted(raw_dir.glob("*_metadata_*.json"))
-
         rows = []
+
         for mp in meta_paths:
             with mp.open("r", encoding="utf-8") as f:
                 meta = json.load(f)
 
+            # base session id (same logic as you had)
             session_id = meta.get("start_timestamp") or mp.stem.replace("_metadata_", "_")
-            rows.append({"session_id": session_id, "metadata_path": str(mp)})
+
+            parquet_entries = meta.get("parquet_files", [])
+            if not parquet_entries:
+                continue
+
+            for seg_idx, ent in enumerate(sorted(parquet_entries, key=lambda e: int(e.get("start_sample", 0)))):
+                fname = ent["filename"]
+                start_sample = int(ent.get("start_sample", 0))
+
+                parquet_path = raw_dir / fname
+                csv_path = parquet_path.with_suffix(".csv")
+                csv_path_str = str(csv_path) if csv_path.exists() else ""
+
+                seg_id = f"{session_id}__seg{seg_idx:03d}__{parquet_path.stem}"
+
+                rows.append(
+                    {
+                        "segment_id": seg_id,
+                        "session_id": session_id,
+                        "segment_index": seg_idx,
+                        "metadata_path": str(mp),
+                        "parquet_path": str(parquet_path),
+                        "csv_path": csv_path_str,
+                        "start_sample": start_sample,
+                    }
+                )
 
         df = pd.DataFrame(rows)
         if df.empty:
             return df
-        return df.set_index("session_id", drop=False)
+        return df.set_index("segment_id", drop=False)
+
 
     def download(self, manifest_item):
+        parquet_path = Path(manifest_item.parquet_path)
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"Missing parquet: {parquet_path}")
+
+        csv_path = Path(manifest_item.csv_path) if getattr(manifest_item, "csv_path", "") else None
+        if csv_path is not None and not csv_path.exists():
+            csv_path = None
+
         metadata_path = Path(manifest_item.metadata_path)
         with metadata_path.open("r", encoding="utf-8") as f:
             meta = json.load(f)
 
-        parquet_entries = meta.get("parquet_files", [])
-        if not parquet_entries:
-            raise RuntimeError(f"No parquet_files found in {metadata_path}")
-
-        # Assume everything is in the SAME directory as raw_dir
-        raw_dir = Path(self.raw_dir)
-
-        segments = []
-        for ent in parquet_entries:
-            fname = ent["filename"]
-            parquet_path = raw_dir / fname
-            if not parquet_path.exists():
-                raise FileNotFoundError(f"Missing parquet: {parquet_path}")
-
-            csv_path = parquet_path.with_suffix(".csv")
-            if not csv_path.exists():
-                csv_path = None  # allow missing annotations
-
-            segments.append(
-                {
-                    "parquet_path": parquet_path,
-                    "csv_path": csv_path,
-                    "start_sample": int(ent.get("start_sample", 0)),
-                }
-            )
-
-        segments.sort(key=lambda x: x["start_sample"])
-
         return {
+            "segment_id": manifest_item.segment_id,
             "session_id": manifest_item.session_id,
-            "metadata_path": metadata_path,
+            "segment_index": int(manifest_item.segment_index),
+            "start_sample": int(manifest_item.start_sample),
             "meta": meta,
-            "segments": segments,
+            "parquet_path": parquet_path,
+            "csv_path": csv_path,
         }
 
     def process(self, download_output):
-        session_id = download_output["session_id"]
+        seg_id = download_output["segment_id"]
         meta = download_output["meta"]
-        segments = download_output["segments"]
+        pq_path = download_output["parquet_path"]
+        start_sample = download_output["start_sample"]
 
-        out_dir = Path(self.args.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{session_id}.h5"
-
+        out_path = self.processed_dir / f"{seg_id}.h5"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         if out_path.exists() and not self.args.reprocess:
             return
 
-        # sampling rate from channel metadata (your metadata has this) 
         channels_meta = meta.get("channels", [])
-        sr_candidates = [c.get("sample_rate") for c in channels_meta if c.get("sample_rate") is not None]
-        if not sr_candidates:
+        sr = next((c.get("sample_rate") for c in channels_meta if c.get("sample_rate") is not None), None)
+        if sr is None:
             raise RuntimeError("No sample_rate found in metadata channels[]")
-        fs = float(sr_candidates[0])
+        fs = float(sr)
 
-        non_signal_cols = set([c.strip() for c in self.args.non_signal_cols.split(",") if c.strip()])
+        df = pd.read_parquet(pq_path)
 
-        kept_channel_labels = [
-            c["label"]
-            for c in channels_meta
-            if (not c.get("is_skipped_by_mask", False)) and (c.get("label") not in non_signal_cols)
-        ]
+        drop_cols = {c.strip() for c in self.args.non_signal_cols.split(",") if c.strip()}
+        candidate = [c.get("label") for c in channels_meta if c.get("label")]
+        sig_cols = [c for c in candidate if c in df.columns and c not in drop_cols]
+        if not sig_cols:
+            numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            sig_cols = [c for c in numeric_cols if c not in drop_cols]
+        if not sig_cols:
+            raise RuntimeError("No signal columns found")
 
         dtype = np.float32 if self.args.dtype == "float32" else np.float64
+        X = df[sig_cols].to_numpy(dtype=dtype, copy=False)   # (n_time, n_chan)
 
-        signal_chunks = []
-        ts_chunks = []
-
-        ann_timestamps = []
-        ann_description = []
-        ann_duration = []
-
-        self.update_status("Loading parquets + annotations")
-
-        for seg in segments:
-            paq = seg["parquet_path"]
-            start_sample = seg["start_sample"]
-            time_offset = start_sample / fs
-
-            table = pq.ParquetFile(str(paq))
-            schema_names = set(table.schema.names)
-            time_candidates = [c for c in ["sample_index", "time"] if c in schema_names]
-
-            if kept_channel_labels:
-                sig_cols = [c for c in kept_channel_labels if c in schema_names]
-            else:
-                # if you must infer: read a small subset or just choose all non-time columns
-                # (better: enforce kept_channel_labels via metadata)
-                sig_cols = [c for c in schema_names if c not in non_signal_cols and c not in time_candidates]
-
-            cols = sig_cols + time_candidates
-            self.update_status(f"started loading {paq}")
-            df = pd.read_parquet(paq, columns=cols, engine="pyarrow")
-            self.update_status(f"finished loading {paq}")
-
-
-            if "sample_index" in df.columns:
-                sample_idx = df["sample_index"].to_numpy(dtype=np.int64, copy=False)
-                t = (sample_idx / fs).astype(np.float64) + time_offset
-            elif "time" in df.columns:
-                t = df["time"].to_numpy(dtype=np.float64, copy=False) + time_offset
-            else:
-                t = (np.arange(len(df), dtype=np.float64) / fs) + time_offset
-
-            X = df[sig_cols].to_numpy(dtype=dtype, copy=False)
-            if X.ndim != 2:
-                raise RuntimeError(f"Signals array not 2D for {paq}: got shape {X.shape}")
-
-            signal_chunks.append(X)
-            ts_chunks.append(t)
-
-            csv_path = seg["csv_path"]
-            if csv_path is not None:
-                adf = pd.read_csv(csv_path)
-
-                if "sample_index" in adf.columns:
-                    at = (adf["sample_index"].to_numpy(dtype=np.float64) / fs) + time_offset
-                elif "time_seconds" in adf.columns:
-                    at = adf["time_seconds"].to_numpy(dtype=np.float64) + time_offset
-                else:
-                    at = None
-
-                if at is not None and "description" in adf.columns:
-                    ann_timestamps.append(at)
-                    desc = adf["description"].astype(str).to_list()
-                    ann_description.append(np.array([s.encode("utf-8", errors="replace") for s in desc], dtype="S"))
-                    if "duration_seconds" in adf.columns:
-                        ann_duration.append(adf["duration_seconds"].to_numpy(dtype=np.float64))
-                    else:
-                        ann_duration.append(np.full(len(at), -1.0, dtype=np.float64))
-
-        X_all = np.concatenate(signal_chunks, axis=0) if signal_chunks else np.empty((0, 0), dtype=dtype)
-        t_all = np.concatenate(ts_chunks, axis=0) if ts_chunks else np.empty((0,), dtype=np.float64)
-
-        if t_all.size > 0:
-            t0 = float(t_all[0])
-            t_all = t_all - t0
-        else:
-            t0 = 0.0
-
-        duration = float(t_all[-1]) if t_all.size > 0 else 0.0
-
-        self.update_status("Building temporaldata objects")
+        # session-relative start in seconds (KEEP it if you want alignment)
+        domain_start = start_sample / fs
 
         ieeg = RegularTimeSeries(
+            data=X,
             sampling_rate=fs,
-            timestamps=t_all,
-            signal=X_all,
-            domain=Interval(start=0.0, end=duration),
-        )
-
-        channels = ArrayDict(
-            label=np.array(
-                [c.encode("utf-8") for c in (kept_channel_labels or list(map(str, range(X_all.shape[1]))))],
-                dtype="S",
-            ),
-        )
-
-        annotations = None
-        if ann_timestamps:
-            at_all = np.concatenate(ann_timestamps, axis=0) - t0
-            ad_all = np.concatenate(ann_description, axis=0)
-            dur_all = np.concatenate(ann_duration, axis=0)
-
-            annotations = IrregularTimeSeries(
-                timestamps=at_all.astype(np.float64),
-                description=ad_all,
-                duration_seconds=dur_all.astype(np.float64),
-                domain="auto",
-            )
-
-        sex_raw = (meta.get("patient_info", {}) or {}).get("sex", None)
-        sex = Sex.UNKNOWN
-        if isinstance(sex_raw, str):
-            if sex_raw.upper().startswith("M"):
-                sex = Sex.MALE
-            elif sex_raw.upper().startswith("F"):
-                sex = Sex.FEMALE
-
-        start_dt_str = meta.get("start_datetime", None)
-        if start_dt_str:
-            try:
-                recording_date = dt.datetime.fromisoformat(start_dt_str)
-            except Exception:
-                recording_date = dt.datetime.utcfromtimestamp(int(meta.get("start_timestamp_utc", 0)))
-        else:
-            recording_date = dt.datetime.utcfromtimestamp(int(meta.get("start_timestamp_utc", 0)))
-
-        brainset_desc = BrainsetDescription(
-            id=self.brainset_id,
-            origin_version="0.0.0",
-            derived_version="0.0.1",
-            source="local_folder",
-            description="Local iEEG parquet+csv session assembled from metadata-defined segments.",
-        )
-
-        subject = SubjectDescription(
-            id=(meta.get("patient_info", {}) or {}).get("name", "unknown_subject"),
-            species=Species.HOMO_SAPIENS,
-            sex=sex,
-        )
-
-        session = SessionDescription(
-            id=session_id,
-            recording_date=recording_date,
-        )
-
-        device = DeviceDescription(
-            id="ieeg_device",
-            recording_tech=RecordingTech.IEEG,
-        )
-
-        data = Data(
-            brainset=brainset_desc,
-            subject=subject,
-            session=session,
-            device=device,
-            ieeg=ieeg,
-            channels=channels,
-            annotations=annotations,
+            domain_start=float(domain_start),
             domain="auto",
         )
 
-        data.set_train_domain(data.domain)
+        n_ch = len(sig_cols)
 
-        self.update_status(f"Writing HDF5 -> {out_path}")
+        channels = ArrayDict(
+            id=np.array(sig_cols, dtype=object),
+            timekeys=np.array([""] * n_ch, dtype=object),  # one per channel
+        )
+
+        data = Data(
+            brainset="iEEG",
+            session=download_output["session_id"],
+            segment=seg_id,
+            ieeg=ieeg,
+            channels=channels,
+            domain=ieeg.domain,
+        )
+
         with h5py.File(out_path, "w") as f:
             data.to_hdf5(f, serialize_fn_map=serialize_fn_map)
+
+        return str(out_path)
